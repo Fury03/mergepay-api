@@ -80,4 +80,48 @@ describe("health routes", () => {
       checks: { stellar: "down" },
     });
   }, 3_000);
+
+  it("returns not ready when the database check times out", async () => {
+    h.queryRaw.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve([{ 1: 1 }]), 2_000))
+    );
+
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      status: "not_ready",
+      checks: { database: "down" },
+    });
+  }, 3_000);
+
+  it("does not leak connection-string details when the database fails", async () => {
+    h.queryRaw.mockRejectedValueOnce(
+      new Error(
+        "connect ECONNREFUSED postgresql://user:secret@db.internal:5432/mergepay"
+      )
+    );
+
+    const response = await app.inject({ method: "GET", url: "/health/ready" });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      status: "not_ready",
+      checks: { database: "down" },
+    });
+    const body = JSON.stringify(response.json());
+    expect(body).not.toContain("postgresql://");
+    expect(body).not.toContain("db.internal");
+    expect(body).not.toContain("secret");
+  });
+
+  it("serves health probes without authentication", async () => {
+    // No Authorization header at all: health routes are outside the auth
+    // plugin and application business authorization, so a probe never 401s.
+    const live = await app.inject({ method: "GET", url: "/health/live" });
+    expect(live.statusCode).toBe(200);
+
+    const ready = await app.inject({ method: "GET", url: "/health/ready" });
+    expect([200, 503]).toContain(ready.statusCode);
+  });
 });
