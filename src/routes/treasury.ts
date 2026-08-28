@@ -69,6 +69,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // concurrent demotion/removal of `auth.id` can't bypass authorization.
     const group = await prisma.$transaction(async (tx) => {
       await requireAdmin(id, auth.id, tx);
+      // Read inside the transaction so the audit entry records the
+      // configuration this call actually replaced.
+      const existing = await tx.group.findUnique({ where: { id } });
       const updated = await tx.group.update({
         where: { id },
         data: {
@@ -79,9 +82,21 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: id,
         action: "treasury.enable",
         entityType: "group",
         entityId: id,
+        outcome: "success",
+        // The multisig configuration is the security-relevant part of this
+        // change: the signing threshold decides how many approvals it takes
+        // to move funds, so an audit needs to see what it was set to and what
+        // it replaced, not merely that the treasury was touched.
+        metadata: {
+          treasuryAccountPublicKey: body.publicKey,
+          previousRequiredSigners: existing?.treasuryRequiredSigners ?? null,
+          requiredSigners: body.requiredSigners ?? 1,
+          previouslyEnabled: existing?.treasuryEnabled ?? false,
+        },
       });
       return updated;
     });
@@ -168,6 +183,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/deposit", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -248,6 +264,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post("/groups/:id/treasury/withdraw", rateLimited("settlementCreate"), async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
+    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -350,6 +367,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     // configuration or accepting any signed envelope. Deposits are additionally
     // owned by their creator; withdrawals require an administrator.
     if (ttx.direction === "deposit") {
+      await requireMembership(ttx.groupId, auth.id);
       if (ttx.userId !== auth.id) {
         throw Errors.forbidden("Only the depositor can confirm this deposit");
       }
